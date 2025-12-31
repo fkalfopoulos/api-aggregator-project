@@ -10,6 +10,11 @@ namespace api_aggregator.Services;
 /// <summary>
 /// Service that aggregates data from multiple external APIs
 /// </summary>
+/// <remarks>
+/// This service coordinates data fetching from multiple external API sources,
+/// applies caching strategies, handles failures gracefully, and provides
+/// filtering and sorting capabilities for aggregated results.
+/// </remarks>
 public class DataAggregatorService : IDataAggregatorService
 {
     private readonly IEnumerable<IExternalApiService> _apiServices;
@@ -18,7 +23,19 @@ public class DataAggregatorService : IDataAggregatorService
     private readonly ILogger<DataAggregatorService> _logger;
     private readonly AggregationOptions _options;
 
-    public DataAggregatorService(IEnumerable<IExternalApiService> apiServices,ICacheService cacheService,IStatisticsService statisticsService, ILogger<DataAggregatorService> logger,
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DataAggregatorService"/> class
+    /// </summary>
+    /// <param name="apiServices">Collection of external API services to aggregate data from</param>
+    /// <param name="cacheService">Service for caching API responses</param>
+    /// <param name="statisticsService">Service for recording API call statistics</param>
+    /// <param name="logger">Logger for tracking aggregation operations</param>
+    /// <param name="options">Configuration options for aggregation behavior</param>
+    public DataAggregatorService(
+        IEnumerable<IExternalApiService> apiServices,
+        ICacheService cacheService,
+        IStatisticsService statisticsService, 
+        ILogger<DataAggregatorService> logger,
         IOptions<AggregationOptions> options)
     {
         _apiServices = apiServices;
@@ -28,6 +45,26 @@ public class DataAggregatorService : IDataAggregatorService
         _options = options.Value;
     }
 
+    /// <summary>
+    /// Aggregates data from multiple external APIs based on the provided request
+    /// </summary>
+    /// <param name="request">The aggregation request containing filters, sorting, and source selection</param>
+    /// <param name="cancellationToken">Token to cancel the operation</param>
+    /// <returns>
+    /// A <see cref="ServiceResult{T}"/> containing the aggregated data response if successful,
+    /// or an error if the operation fails
+    /// </returns>
+    /// <remarks>
+    /// The method performs the following operations:
+    /// <list type="number">
+    /// <item><description>Filters API services based on the request sources</description></item>
+    /// <item><description>Fetches data from all selected APIs in parallel</description></item>
+    /// <item><description>Applies filters (category, date range) to the combined results</description></item>
+    /// <item><description>Sorts the results based on the specified criteria</description></item>
+    /// <item><description>Limits the results to the maximum number of items if specified</description></item>
+    /// <item><description>Records performance metrics and statistics</description></item>
+    /// </list>
+    /// </remarks>
     public async Task<ServiceResult<AggregatedDataResponse>> AggregateDataAsync(AggregationRequest request, CancellationToken cancellationToken = default)
     {
         try
@@ -35,6 +72,7 @@ public class DataAggregatorService : IDataAggregatorService
             var overallStopwatch = Stopwatch.StartNew();
             var response = new AggregatedDataResponse();
 
+            // Filter services based on requested sources
             var servicesToQuery = _apiServices;
             if (request.Sources?.Any() == true)
             {
@@ -42,9 +80,11 @@ public class DataAggregatorService : IDataAggregatorService
                     request.Sources.Contains(s.ServiceName, StringComparer.OrdinalIgnoreCase));
             }
 
+            // Fetch data from all services in parallel
             var tasks = servicesToQuery.Select(service => FetchFromApiAsync(service, cancellationToken));
             var results = await Task.WhenAll(tasks);
 
+            // Combine results from all APIs
             var allItems = new List<DataItem>();
             foreach (var result in results)
             {
@@ -62,14 +102,19 @@ public class DataAggregatorService : IDataAggregatorService
                 }
             }
 
+            // Check if all APIs are required and any failed
             if (_options.RequireAllApis && response.Metadata.FailedApis.Any())
             {
-                return new ServiceResult<AggregatedDataResponse>( ApiErrorCode.GenericError, $"One or more required APIs failed: {string.Join(", ", response.Metadata.FailedApis)}");
+                return new ServiceResult<AggregatedDataResponse>( 
+                    ApiErrorCode.GenericError, 
+                    $"One or more required APIs failed: {string.Join(", ", response.Metadata.FailedApis)}");
             }
 
+            // Apply filters and sorting
             var filteredItems = ApplyFilters(allItems, request);
             var sortedItems = ApplySorting(filteredItems, request);
 
+            // Limit results if MaxItems is specified
             if (request.MaxItems.HasValue && request.MaxItems > 0)
             {
                 sortedItems = sortedItems.Take(request.MaxItems.Value).ToList();
@@ -87,10 +132,31 @@ public class DataAggregatorService : IDataAggregatorService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during aggregation");
-            return new ServiceResult<AggregatedDataResponse>(ApiErrorCode.GenericError,$"Error during aggregation: {ex.Message}", ex);
+            return new ServiceResult<AggregatedDataResponse>(
+                ApiErrorCode.GenericError,
+                $"Error during aggregation: {ex.Message}", 
+                ex);
         }
     }
 
+    /// <summary>
+    /// Fetches data from a single external API service with caching support
+    /// </summary>
+    /// <param name="service">The external API service to fetch data from</param>
+    /// <param name="cancellationToken">Token to cancel the operation</param>
+    /// <returns>
+    /// An <see cref="AggregatorResult"/> containing the fetched items and metadata
+    /// </returns>
+    /// <remarks>
+    /// This method:
+    /// <list type="bullet">
+    /// <item><description>Checks the cache first to avoid unnecessary API calls</description></item>
+    /// <item><description>Fetches data from the API if cache miss occurs</description></item>
+    /// <item><description>Caches successful responses for future requests</description></item>
+    /// <item><description>Records performance statistics for success and failure cases</description></item>
+    /// <item><description>Handles exceptions gracefully and returns empty results on failure</description></item>
+    /// </list>
+    /// </remarks>
     private async Task<AggregatorResult> FetchFromApiAsync(IExternalApiService service, CancellationToken cancellationToken)
     {
         var stopwatch = Stopwatch.StartNew();
@@ -98,6 +164,7 @@ public class DataAggregatorService : IDataAggregatorService
 
         try
         {
+            // Check cache first
             var cacheResult = _cacheService.Get<List<DataItem>>(cacheKey);
             if (cacheResult.Success && cacheResult.Value != null)
             {
@@ -115,6 +182,7 @@ public class DataAggregatorService : IDataAggregatorService
                 };
             }
 
+            // Fetch from API
             _logger.LogInformation("Fetching data from {ServiceName}", service.ServiceName);
             
             var result = await service.FetchDataAsync(cancellationToken);
@@ -123,6 +191,7 @@ public class DataAggregatorService : IDataAggregatorService
 
             if (result.Success && result.Value != null)
             {
+                // Cache successful response
                 _cacheService.Set(cacheKey, result.Value, _options.CacheDurationMinutes);
                 
                 _statisticsService.RecordSuccess(service.ServiceName, stopwatch.ElapsedMilliseconds, fromCache: false);
@@ -171,6 +240,20 @@ public class DataAggregatorService : IDataAggregatorService
         }
     }
 
+    /// <summary>
+    /// Applies filtering logic to the aggregated data items
+    /// </summary>
+    /// <param name="items">The list of data items to filter</param>
+    /// <param name="request">The aggregation request containing filter criteria</param>
+    /// <returns>A filtered list of data items</returns>
+    /// <remarks>
+    /// Supports filtering by:
+    /// <list type="bullet">
+    /// <item><description>Category (case-insensitive)</description></item>
+    /// <item><description>From date (items on or after this date)</description></item>
+    /// <item><description>To date (items on or before this date)</description></item>
+    /// </list>
+    /// </remarks>
     private List<DataItem> ApplyFilters(List<DataItem> items, AggregationRequest request)
     {
         var filtered = items.AsEnumerable();
@@ -194,6 +277,21 @@ public class DataAggregatorService : IDataAggregatorService
         return filtered.ToList();
     }
 
+    /// <summary>
+    /// Applies sorting logic to the filtered data items
+    /// </summary>
+    /// <param name="items">The list of data items to sort</param>
+    /// <param name="request">The aggregation request containing sort criteria</param>
+    /// <returns>A sorted list of data items</returns>
+    /// <remarks>
+    /// Supports sorting by:
+    /// <list type="bullet">
+    /// <item><description>timestamp - Sort by the item's timestamp (default)</description></item>
+    /// <item><description>relevance - Sort by the item's relevance score</description></item>
+    /// <item><description>title - Sort alphabetically by the item's title</description></item>
+    /// </list>
+    /// Sort direction can be ascending or descending (default: descending for timestamp)
+    /// </remarks>
     private List<DataItem> ApplySorting(List<DataItem> items, AggregationRequest request)
     {
         var sortBy = request.SortBy?.ToLowerInvariant() ?? "timestamp";
@@ -218,12 +316,34 @@ public class DataAggregatorService : IDataAggregatorService
         return sorted.ToList();
     }
 
+    /// <summary>
+    /// Internal class that holds the result of a single API fetch operation
+    /// </summary>
     private class AggregatorResult
     {
+        /// <summary>
+        /// Gets or sets the name of the API service
+        /// </summary>
         public string ApiName { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the data items fetched from the API
+        /// </summary>
         public List<DataItem> Items { get; set; } = new();
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the data was retrieved from cache
+        /// </summary>
         public bool FromCache { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the fetch operation was successful
+        /// </summary>
         public bool Success { get; set; }
+
+        /// <summary>
+        /// Gets or sets the error message if the fetch operation failed
+        /// </summary>
         public string? ErrorMessage { get; set; }
     }
 }

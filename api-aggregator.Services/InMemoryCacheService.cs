@@ -35,7 +35,7 @@ public class InMemoryCacheService : ICacheService
             var cacheOptions = new MemoryCacheEntryOptions
             {
                 AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(expirationMinutes),
-                SlidingExpiration = TimeSpan.FromMinutes(expirationMinutes / 2)
+                SlidingExpiration = TimeSpan.FromMinutes(expirationMinutes / 2) //less ram
             };
 
             _cache.Set(key, value, cacheOptions);
